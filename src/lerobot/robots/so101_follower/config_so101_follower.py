@@ -39,3 +39,45 @@ class SO101FollowerConfig(RobotConfig):
 
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = False
+
+
+@dataclass
+class SO101FollowerHostConfig:
+    """Runs on the computer wired to the follower arm. See `so101_follower_host.py`."""
+
+    robot: SO101FollowerConfig
+
+    # Interface to listen on. "*" listens everywhere; pass a Tailscale/VPN IP to listen only there.
+    bind_ip: str = "*"
+    port_zmq_cmd: int = 5555
+    port_zmq_observations: int = 5556
+
+    # Log a warning when no command arrives for this long. The arm holds its last goal position.
+    watchdog_timeout_ms: int = 500
+
+    max_loop_freq_hz: int = 30
+
+    # Lower this to save upload bandwidth (each 640x480 frame is ~30-60 KB at 80).
+    jpeg_quality: int = 80
+
+    # Stop after this many seconds. None runs until Ctrl+C.
+    connection_time_s: float | None = None
+
+
+@RobotConfig.register_subclass("so101_follower_client")
+@dataclass
+class SO101FollowerClientConfig(RobotConfig):
+    """Stands in for a follower arm attached to another computer running `so101_follower_host`."""
+
+    # IP or hostname of the computer running the host
+    remote_ip: str
+    port_zmq_cmd: int = 5555
+    port_zmq_observations: int = 5556
+
+    # Must use the same names, width and height as the host's `--robot.cameras`. Only the shapes are used
+    # here (to declare dataset features); `index_or_path` is ignored.
+    cameras: dict[str, CameraConfig] = field(default_factory=dict)
+
+    # How long `get_observation()` waits for a fresh observation before returning the last one.
+    polling_timeout_ms: int = 15
+    connect_timeout_s: int = 10
