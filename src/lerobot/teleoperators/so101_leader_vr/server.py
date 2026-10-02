@@ -43,6 +43,8 @@ logger = logging.getLogger(__name__)
 JPEG_QUALITY = 70
 STATUS_HZ = 10
 FAILURE_LOG_PERIOD_S = 5.0
+# A headset that takes longer than this to accept a message has stopped reading: it is dropped.
+SEND_TIMEOUT_S = 0.5
 
 
 def lan_ip() -> str:
@@ -172,6 +174,7 @@ class VRServer:
         self._frames_new = False
         self._status: dict | None = None
         self._clients: set[web.WebSocketResponse] = set()
+        self._transports: dict[web.WebSocketResponse, asyncio.BaseTransport] = {}
 
         self._last_failure_log: dict[str, float] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -243,13 +246,16 @@ class VRServer:
         try:
             loop.run_forever()
         finally:
-            for task in tasks:
-                task.cancel()
-            loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
-            for ws in list(self._clients):
-                loop.run_until_complete(ws.close())
-            loop.run_until_complete(runner.cleanup())
-            loop.close()
+            try:
+                for task in tasks:
+                    task.cancel()
+                loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+                # Abort rather than close: closing waits on headsets that may never read again.
+                for ws in list(self._clients):
+                    self._drop(ws)
+                loop.run_until_complete(runner.cleanup())
+            finally:
+                loop.close()
 
     async def _index(self, request: web.Request) -> web.StreamResponse:
         return web.FileResponse(self.client_dir / "index.html")
@@ -260,6 +266,7 @@ class VRServer:
         ws = web.WebSocketResponse(heartbeat=5.0)
         await ws.prepare(request)
         self._clients.add(ws)
+        self._transports[ws] = request.transport
         logger.info(f"Headset connected from {request.remote}.")
         await ws.send_json({"type": "hello", "hand": self.hand})
         try:
@@ -278,15 +285,28 @@ class VRServer:
                     self._latest = sample
         finally:
             self._clients.discard(ws)
+            self._transports.pop(ws, None)
             logger.info("Headset disconnected.")
         return ws
 
     async def _send_to_all(self, send) -> None:
-        for ws in list(self._clients):
-            try:
-                await send(ws)
-            except (ConnectionError, RuntimeError):
-                self._clients.discard(ws)
+        """Sends to every headset at once, so one that stopped reading can't hold up the others."""
+        await asyncio.gather(*(self._send_one(ws, send) for ws in list(self._clients)))
+
+    async def _send_one(self, ws: web.WebSocketResponse, send) -> None:
+        try:
+            await asyncio.wait_for(send(ws), SEND_TIMEOUT_S)
+        except (asyncio.TimeoutError, ConnectionError, RuntimeError):
+            logger.warning(
+                "A headset stopped reading; dropping its connection (the page reconnects by itself)."
+            )
+            self._drop(ws)
+
+    def _drop(self, ws: web.WebSocketResponse) -> None:
+        self._clients.discard(ws)
+        transport = self._transports.pop(ws, None)
+        if transport is not None:
+            transport.abort()
 
     def _log_failure(self, what: str) -> None:
         """Logs the exception being handled, at most every few seconds per kind: the streams keep going."""

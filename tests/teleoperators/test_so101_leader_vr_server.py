@@ -1,7 +1,10 @@
 """The virtual leader's web server: serves the headset page, takes headset input, streams frames and status."""
 
 import asyncio
+import base64
 import json
+import os
+import socket
 import ssl
 import time
 
@@ -241,3 +244,68 @@ def test_frame_stream_survives_a_frame_it_cannot_encode(server):
     data = run(receive_frame())
 
     assert data[1 : 1 + data[0]] == b"front"
+
+
+def stuck_client(port):
+    """A WebSocket client that completes the handshake and then never reads, like a page on a device that slept."""
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    sock.connect(("127.0.0.1", port))
+    key = base64.b64encode(os.urandom(16)).decode()
+    sock.sendall(
+        f"GET /ws?k={TOKEN} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n"
+        f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode()
+    )
+    assert b" 101 " in sock.recv(1024)
+    return sock
+
+
+NOISE = np.random.default_rng(0).integers(0, 256, (480, 640, 3), dtype=np.uint8)  # big JPEGs
+
+
+def test_a_client_that_stops_reading_does_not_freeze_frames_for_others(server):
+    stuck = stuck_client(server.port)
+
+    async def watch():
+        async with (
+            aiohttp.ClientSession() as session,
+            session.ws_connect(f"http://127.0.0.1:{server.port}/ws?k={TOKEN}") as ws,
+        ):
+            await ws.receive_json()
+            arrivals, end = [], time.monotonic() + 4.0
+            while time.monotonic() < end:
+                server.publish_frames({"front": NOISE})
+                try:
+                    message = await asyncio.wait_for(ws.receive(), timeout=0.05)
+                    if message.type == aiohttp.WSMsgType.BINARY:
+                        arrivals.append(time.monotonic())
+                except asyncio.TimeoutError:
+                    pass
+            return arrivals, end
+
+    try:
+        arrivals, end = run(watch())
+    finally:
+        stuck.close()
+
+    assert sum(1 for t in arrivals if t > end - 1.0) >= 5  # still streaming at the end
+
+
+def test_stop_frees_the_port_while_a_client_is_stuck(client_dir):
+    server = VRServer(client_dir, port=0, https=False, token=TOKEN, hand="right", stream_fps=50)
+    server.start()
+    port = server.port
+    stuck = stuck_client(port)
+    try:
+        for _ in range(100):  # fill the stuck client's buffers
+            server.publish_frames({"front": NOISE})
+            time.sleep(0.02)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 6
+    finally:
+        stuck.close()
+
+    again = VRServer(client_dir, port=port, https=False, token=TOKEN, hand="right", stream_fps=20)
+    again.start()
+    again.stop()
