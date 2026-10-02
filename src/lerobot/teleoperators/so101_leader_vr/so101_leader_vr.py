@@ -56,6 +56,8 @@ STATE_DIR = HF_LEROBOT_HOME / "so101_leader_vr"
 # vr_client/ next to the lerobot checkout (the workspace repo).
 DEFAULT_CLIENT_DIR = Path(lerobot.__file__).resolve().parents[3] / "vr_client"
 DRY_RUN_LOG_PERIOD_S = 0.5
+# No new camera frame from the robot for this long: the operator is warned that the video is frozen.
+VIDEO_STALE_S = 0.5
 
 
 class SO101LeaderVR(Teleoperator):
@@ -69,6 +71,11 @@ class SO101LeaderVR(Teleoperator):
         self.controller: VRArmController | None = None
         self._start: dict[str, float] | None = None
         self._last_log = 0.0
+        self._clock = time.monotonic
+        # The last frames handed over, kept alive so a new frame can't reuse their identity.
+        self._last_frames: dict[str, np.ndarray] = {}
+        self._last_new_frame: float | None = None
+        self.status: dict = {}
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -131,8 +138,11 @@ class SO101LeaderVR(Teleoperator):
             for key, value in observation.items()
             if isinstance(value, np.ndarray) and value.ndim == 3
         }
-        if frames:
+        # When nothing new arrives, the robot client hands back the same frame objects.
+        if any(self._last_frames.get(name) is not frame for name, frame in frames.items()):
+            self._last_new_frame = self._clock()
             self.server.publish_frames(frames)
+        self._last_frames = frames
 
     def get_action(self) -> dict[str, float]:
         if not self.is_connected:
@@ -143,7 +153,11 @@ class SO101LeaderVR(Teleoperator):
                 "(recording with it isn't supported yet)."
             )
         action = self.controller.step(self.server.latest(), time.monotonic())
-        self.server.publish_status(self.controller.status)
+        video_stale = (
+            self._last_new_frame is not None and self._clock() - self._last_new_frame > VIDEO_STALE_S
+        )
+        self.status = {**self.controller.status, "video_stale": bool(video_stale)}
+        self.server.publish_status(self.status)
         if not self.config.dry_run:
             return action
 
@@ -155,9 +169,7 @@ class SO101LeaderVR(Teleoperator):
             )
             tip = self.controller.kinematics.fk(angles)[:3, 3]
             would_send = {key: round(value, 1) for key, value in action.items()}
-            logger.info(
-                f"Dry run: tip at {np.round(tip, 3)} m, would send {would_send}, {self.controller.status}"
-            )
+            logger.info(f"Dry run: tip at {np.round(tip, 3)} m, would send {would_send}, {self.status}")
         return dict(self._start)
 
     def send_feedback(self, feedback: dict[str, float]) -> None:

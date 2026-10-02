@@ -174,3 +174,43 @@ def test_dry_run_never_moves_the_arm(setup):
         teleop.disconnect()
 
     assert all(action == JOINTS for action in actions)
+
+
+def test_status_says_when_the_robots_video_stops(setup):
+    teleop = setup()
+    teleop.connect()
+    try:
+        now = [0.0]
+        teleop._clock = lambda: now[0]
+        frame = np.zeros((24, 32, 3), dtype=np.uint8)
+
+        teleop.on_observation({**JOINTS, "front": frame})
+        teleop.get_action()
+        assert teleop.status["video_stale"] is False
+
+        now[0] = 1.0  # the robot client hands back the same frame: nothing new arrived
+        teleop.on_observation({**JOINTS, "front": frame})
+        teleop.get_action()
+        assert teleop.status["video_stale"] is True
+
+        now[0] = 1.1
+        teleop.on_observation({**JOINTS, "front": frame.copy()})
+        teleop.get_action()
+        assert teleop.status["video_stale"] is False
+    finally:
+        teleop.disconnect()
+
+
+def test_without_cameras_the_video_is_never_reported_stale(setup):
+    teleop = setup()
+    teleop.connect()
+    try:
+        now = [0.0]
+        teleop._clock = lambda: now[0]
+        teleop.on_observation(JOINTS)
+        now[0] = 5.0
+        teleop.on_observation(JOINTS)
+        teleop.get_action()
+        assert teleop.status["video_stale"] is False
+    finally:
+        teleop.disconnect()
