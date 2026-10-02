@@ -33,6 +33,7 @@ python -m lerobot.robots.so101_follower.so101_follower_host \
 import base64
 import json
 import logging
+import threading
 import time
 from dataclasses import asdict
 from pprint import pformat
@@ -80,51 +81,99 @@ class SO101FollowerHost:
         self.zmq_context.term()
 
 
-def run_host(robot: Robot, host: SO101FollowerHost) -> None:
-    """Applies the latest command and publishes the latest observation, at most `max_loop_freq_hz` times a second."""
+def _control_loop(
+    robot: Robot, host: SO101FollowerHost, joints: dict, lock: threading.Lock, stop: threading.Event
+):
+    """Applies each command as soon as it arrives and keeps `joints` up to date. The only thread using the bus."""
     cfg = host.config
-    camera_keys = set(getattr(robot, "cameras", {}))
     last_cmd_time = None
     watchdog_active = False
+    last_read = 0.0
+    n_cmds, last_stats = 0, time.perf_counter()
 
-    logging.info(
-        f"Listening on {cfg.bind_ip}:{cfg.port_zmq_cmd} (commands) and :{cfg.port_zmq_observations} (observations)"
-    )
-    start = time.perf_counter()
-    while cfg.connection_time_s is None or time.perf_counter() - start < cfg.connection_time_s:
-        loop_start = time.perf_counter()
+    while not stop.is_set():
+        if host.zmq_cmd_socket.poll(5, zmq.POLLIN):
+            try:
+                robot.send_action(json.loads(host.zmq_cmd_socket.recv_string(zmq.NOBLOCK)))
+                n_cmds += 1
+                if last_cmd_time is None or watchdog_active:
+                    logging.info("Receiving commands")
+                last_cmd_time = time.perf_counter()
+                watchdog_active = False
+            except zmq.Again:
+                pass
+            except Exception as e:
+                logging.error("Failed to apply command: %s", e)
 
-        try:
-            action = json.loads(host.zmq_cmd_socket.recv_string(zmq.NOBLOCK))
-            robot.send_action(action)
-            if last_cmd_time is None or watchdog_active:
-                logging.info("Receiving commands")
-            last_cmd_time = time.perf_counter()
-            watchdog_active = False
-        except zmq.Again:
-            pass
-        except Exception as e:
-            logging.error("Failed to apply command: %s", e)
-
+        now = time.perf_counter()
         if (
             last_cmd_time is not None
             and not watchdog_active
-            and time.perf_counter() - last_cmd_time > cfg.watchdog_timeout_ms / 1000
+            and now - last_cmd_time > cfg.watchdog_timeout_ms / 1000
         ):
             # The servos keep their last goal position, so the arm just holds still.
             logging.warning(f"No command for {cfg.watchdog_timeout_ms} ms. Holding position.")
             watchdog_active = True
 
-        observation = robot.get_observation()
-        try:
-            host.zmq_observation_socket.send_string(
-                host.encode_observation(observation, camera_keys), flags=zmq.NOBLOCK
-            )
-        except zmq.Again:
-            pass  # no client connected
+        if now - last_read >= 1 / 60:
+            try:
+                present = robot.bus.sync_read("Present_Position")
+                with lock:
+                    joints.update({f"{motor}.pos": val for motor, val in present.items()})
+                last_read = now
+            except Exception as e:
+                logging.error("Failed to read joints: %s", e)
 
-        elapsed = time.perf_counter() - loop_start
-        time.sleep(max(1 / cfg.max_loop_freq_hz - elapsed, 0))
+        if now - last_stats >= 10:
+            if n_cmds:
+                logging.info(f"Applying {n_cmds / (now - last_stats):.0f} commands/s")
+            n_cmds, last_stats = 0, now
+
+
+def run_host(robot: Robot, host: SO101FollowerHost) -> None:
+    """
+    Runs motor control in a background thread, so commands are applied as soon as they arrive instead of
+    waiting on the cameras. This thread publishes the latest joints with fresh camera frames, at most
+    `max_loop_freq_hz` times a second.
+    """
+    cfg = host.config
+    cameras = dict(getattr(robot, "cameras", {}))
+    joints: dict = {}
+    lock = threading.Lock()
+    stop = threading.Event()
+    control = threading.Thread(target=_control_loop, args=(robot, host, joints, lock, stop), daemon=True)
+
+    logging.info(
+        f"Listening on {cfg.bind_ip}:{cfg.port_zmq_cmd} (commands) and :{cfg.port_zmq_observations} (observations)"
+    )
+    control.start()
+    start = time.perf_counter()
+    try:
+        while cfg.connection_time_s is None or time.perf_counter() - start < cfg.connection_time_s:
+            loop_start = time.perf_counter()
+
+            observation = {}
+            for key, cam in cameras.items():
+                try:
+                    observation[key] = cam.async_read()
+                except Exception as e:
+                    logging.warning("Camera %s: %s", key, e)
+            with lock:
+                observation.update(joints)
+
+            if observation:
+                try:
+                    host.zmq_observation_socket.send_string(
+                        host.encode_observation(observation, cameras.keys()), flags=zmq.NOBLOCK
+                    )
+                except zmq.Again:
+                    pass  # no client connected
+
+            elapsed = time.perf_counter() - loop_start
+            time.sleep(max(1 / cfg.max_loop_freq_hz - elapsed, 0))
+    finally:
+        stop.set()
+        control.join()
 
 
 @draccus.wrap()

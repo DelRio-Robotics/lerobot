@@ -55,6 +55,7 @@ class SO101FollowerHostConfig:
     # Log a warning when no command arrives for this long. The arm holds its last goal position.
     watchdog_timeout_ms: int = 500
 
+    # Max rate of observations (joints + camera frames) sent back. Commands are applied as they arrive regardless.
     max_loop_freq_hz: int = 30
 
     # Lower this to save upload bandwidth (each 640x480 frame is ~30-60 KB at 80).
