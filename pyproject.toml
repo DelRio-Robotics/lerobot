@@ -107,6 +107,7 @@ gamepad = ["lerobot[pygame-dep]", "hidapi>=0.14.0"]
 hopejr = ["lerobot[feetech]", "lerobot[pygame-dep]"]
 lekiwi = ["lerobot[feetech]", "pyzmq>=26.2.1"]
 kinematics = ["lerobot[placo-dep]"]
+so101_leader_vr = ["lerobot[placo-dep]", "aiohttp>=3.9", "cryptography>=42"]
 intelrealsense = [
     "pyrealsense2>=2.55.1.6486 ; sys_platform != 'darwin'",
     "pyrealsense2-macosx>=2.54 ; sys_platform == 'darwin'",

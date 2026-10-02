@@ -105,12 +105,19 @@ def teleop_loop(
     teleop: Teleoperator, robot: Robot, fps: int, display_data: bool = False, duration: float | None = None
 ):
     display_len = max(len(key) for key in robot.action_features)
+    # Teleops that act on the robot's state (e.g. so101_leader_vr) get each observation before their action.
+    on_observation = getattr(teleop, "on_observation", None)
     start = time.perf_counter()
     while True:
         loop_start = time.perf_counter()
+        observation = None
+        if on_observation is not None:
+            observation = robot.get_observation()
+            on_observation(observation)
         action = teleop.get_action()
         if display_data:
-            observation = robot.get_observation()
+            if observation is None:
+                observation = robot.get_observation()
             log_rerun_data(observation, action)
 
         robot.send_action(action)
