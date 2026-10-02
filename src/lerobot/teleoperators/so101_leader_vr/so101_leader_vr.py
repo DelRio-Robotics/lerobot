@@ -95,7 +95,7 @@ class SO101LeaderVR(Teleoperator):
 
     def connect(self, calibrate: bool = True) -> None:
         if self.is_connected:
-            raise DeviceAlreadyConnectedError(f"{self} already connected")
+            raise DeviceAlreadyConnectedError(f"{self.name} already connected")
 
         calibration = load_follower_calibration(self.config.follower_id, self.config.follower_calibration_dir)
         client_dir = Path(self.config.client_dir or DEFAULT_CLIENT_DIR)
@@ -117,12 +117,12 @@ class SO101LeaderVR(Teleoperator):
         )
         server.start()
         self.server = server
-        logger.info(f"{self} connected. Open this in the headset's browser: {server.url}")
+        logger.info(f"{self.name} ready. Open this in the headset's browser: {server.url}")
 
     def on_observation(self, observation: dict) -> None:
         """Takes the follower's joint readings and camera frames, from the teleop loop."""
         if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
+            raise DeviceNotConnectedError(f"{self.name} is not connected.")
         self.controller.observe(observation)
         if self._start is None:
             self._start = dict(self.controller.measured)
@@ -136,10 +136,10 @@ class SO101LeaderVR(Teleoperator):
 
     def get_action(self) -> dict[str, float]:
         if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
+            raise DeviceNotConnectedError(f"{self.name} is not connected.")
         if self._start is None:
             raise RuntimeError(
-                f"{self} needs the robot's observations: run it with lerobot-teleoperate, which hands them over "
+                f"{self.name} needs the robot's observations: run it with lerobot-teleoperate, which hands them over "
                 "(recording with it isn't supported yet)."
             )
         action = self.controller.step(self.server.latest(), time.monotonic())
@@ -165,7 +165,7 @@ class SO101LeaderVR(Teleoperator):
 
     def disconnect(self) -> None:
         if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
+            raise DeviceNotConnectedError(f"{self.name} is not connected.")
         self.server.stop()
         self.server = None
-        logger.info(f"{self} disconnected.")
+        logger.info(f"{self.name} stopped.")
