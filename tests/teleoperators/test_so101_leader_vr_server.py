@@ -201,3 +201,43 @@ def test_certificate_and_token_are_created_once_and_reused(tmp_path):
     token = load_or_create_token(tmp_path)
     assert len(token) >= 6
     assert load_or_create_token(tmp_path) == token
+
+
+def test_status_stream_survives_a_status_it_cannot_send(server):
+    async def receive_status():
+        async with (
+            aiohttp.ClientSession() as session,
+            session.ws_connect(f"http://127.0.0.1:{server.port}/ws?k={TOKEN}") as ws,
+        ):
+            await ws.receive_json()
+            server.publish_status({"engaged": object()})
+            await asyncio.sleep(0.3)
+            server.publish_status({"engaged": True, "stale": False, "limited": False})
+            while True:
+                message = await asyncio.wait_for(ws.receive_json(), timeout=2)
+                if message["type"] == "status":
+                    return message
+
+    assert run(receive_status())["engaged"] is True
+
+
+def test_frame_stream_survives_a_frame_it_cannot_encode(server):
+    good = np.zeros((48, 64, 3), dtype=np.uint8)
+
+    async def receive_frame():
+        async with (
+            aiohttp.ClientSession() as session,
+            session.ws_connect(f"http://127.0.0.1:{server.port}/ws?k={TOKEN}") as ws,
+        ):
+            await ws.receive_json()
+            server.publish_frames({"bad": np.zeros((8, 8, 3), dtype=np.float64)})
+            await asyncio.sleep(0.2)
+            server.publish_frames({"front": good})
+            while True:
+                message = await asyncio.wait_for(ws.receive(), timeout=2)
+                if message.type == aiohttp.WSMsgType.BINARY:
+                    return message.data
+
+    data = run(receive_frame())
+
+    assert data[1 : 1 + data[0]] == b"front"

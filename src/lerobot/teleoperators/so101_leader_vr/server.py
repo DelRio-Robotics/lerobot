@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 JPEG_QUALITY = 70
 STATUS_HZ = 10
+FAILURE_LOG_PERIOD_S = 5.0
 
 
 def lan_ip() -> str:
@@ -172,6 +173,7 @@ class VRServer:
         self._status: dict | None = None
         self._clients: set[web.WebSocketResponse] = set()
 
+        self._last_failure_log: dict[str, float] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
@@ -286,6 +288,13 @@ class VRServer:
             except (ConnectionError, RuntimeError):
                 self._clients.discard(ws)
 
+    def _log_failure(self, what: str) -> None:
+        """Logs the exception being handled, at most every few seconds per kind: the streams keep going."""
+        now = time.monotonic()
+        if now - self._last_failure_log.get(what, -FAILURE_LOG_PERIOD_S) >= FAILURE_LOG_PERIOD_S:
+            self._last_failure_log[what] = now
+            logger.exception(f"Couldn't {what}; carrying on.")
+
     async def _stream_frames(self) -> None:
         loop = asyncio.get_running_loop()
         while True:
@@ -296,15 +305,22 @@ class VRServer:
             if not frames or not self._clients:
                 continue
             for name, frame in frames.items():
-                data = await loop.run_in_executor(None, encode_frame, name, frame)
-                if data is not None:
-                    await self._send_to_all(lambda ws, data=data: ws.send_bytes(data))
+                try:
+                    data = await loop.run_in_executor(None, encode_frame, name, frame)
+                    if data is not None:
+                        await self._send_to_all(lambda ws, data=data: ws.send_bytes(data))
+                except Exception:
+                    self._log_failure(f"send the {name!r} camera frame")
 
     async def _stream_status(self) -> None:
         while True:
             await asyncio.sleep(1 / STATUS_HZ)
             with self._lock:
                 status = self._status
-            if status is not None and self._clients:
+            if status is None or not self._clients:
+                continue
+            try:
                 message = {"type": "status", **status}
                 await self._send_to_all(lambda ws, message=message: ws.send_json(message))
+            except Exception:
+                self._log_failure("send the status")

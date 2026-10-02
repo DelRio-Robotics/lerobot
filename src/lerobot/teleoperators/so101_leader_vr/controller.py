@@ -161,7 +161,7 @@ class VRArmController:
         tip_z = self.kinematics.fk(angles)[2, 3]
         # The target is already clipped to the floor; this catches IK solutions that dip well below it.
         sinks = tip_z < self._low[2] - _FLOOR_TOLERANCE_M and tip_z < self.kinematics.fk(self._angles)[2, 3]
-        self.status["limited"] = clipped or stepped or sinks
+        self.status["limited"] = bool(clipped or stepped or sinks)
         if sinks:
             return
         self._hold = to_follower_units(

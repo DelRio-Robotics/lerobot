@@ -1,5 +1,6 @@
 """How the virtual leader turns headset input into follower actions (no network, real kinematics)."""
 
+import json
 import math
 
 import numpy as np
@@ -226,3 +227,16 @@ def test_ik_solutions_that_dip_below_the_floor_are_refused():
     arm = [key for key in OBSERVATION if key != "gripper.pos"]
     assert {key: action[key] for key in arm} == {key: OBSERVATION[key] for key in arm}
     assert controller.status["limited"]
+
+
+@pytest.mark.parametrize("direction, at_limit", [(XR_FORWARD, False), ((0, -1.0, 0), True)])
+def test_status_is_plain_json_while_moving_and_at_limits(direction, at_limit):
+    start = tip_of(OBSERVATION)
+    operator = Operator(ee_bounds_min=[-0.45, -0.45, start[2] - 0.02])
+
+    operator.move(direction, 0.1 if at_limit else 0.02)  # down 10 cm runs into the floor
+
+    status = operator.controller.status
+    assert status["limited"] == at_limit
+    assert all(type(value) is bool for value in status.values())
+    assert json.loads(json.dumps(status)) == status
