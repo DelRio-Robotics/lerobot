@@ -102,19 +102,91 @@ def limit_step(previous: np.ndarray, point: np.ndarray, max_step: float) -> tupl
     return previous + step * (max_step / length), True
 
 
-def align_yaw_with_position(rotation: np.ndarray, position: np.ndarray, pan_axis: np.ndarray) -> np.ndarray:
+# Below this distance from the pan axis, the arm's plane is ill-defined (the tip is above the shoulder).
+MIN_RADIUS_M = 0.02
+
+
+def _quat_multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return np.array(
+        [
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ]
+    )
+
+
+def pointing_elevation(q: np.ndarray) -> float:
+    """How far up the controller points (its -z axis), in radians: 0 level, -pi/2 straight down."""
+    pointing = quat_to_matrix(q) @ np.array([0.0, 0.0, -1.0])
+    return math.asin(min(max(pointing[1], -1.0), 1.0))
+
+
+def hand_twist(q0: np.ndarray, q: np.ndarray) -> float:
     """
-    Turns a tip orientation about the vertical so its approach (the tip's z axis) lies in the vertical plane
-    through the shoulder pan axis and `position`. The SO-101's pitch joints all move in that plane, so this is
-    the only yaw it can reach there: without it, the orientation goal fights the pan on sideways moves.
-    Pitch and roll are kept. An approach within ~10 degrees of vertical is left as is.
+    How far the controller has turned about the axis it points along since orientation `q0`, in radians
+    (right-handed about the pointing direction), ignoring any turning or pitching. Like turning a doorknob.
     """
-    approach = rotation[:, 2]
-    if math.hypot(approach[0], approach[1]) < 0.17:
-        return rotation
-    radial = np.asarray(position[:2]) - np.asarray(pan_axis)
-    turn = math.atan2(radial[1], radial[0]) - math.atan2(approach[1], approach[0])
-    turn = (turn + math.pi) % (2 * math.pi) - math.pi
-    if abs(turn) > math.pi / 2:  # the approach points back toward the base: keep it that way
-        turn -= math.copysign(math.pi, turn)
-    return _rot_about(2, turn) @ rotation
+    x0, y0, z0, w0 = np.asarray(q0, dtype=float) / np.linalg.norm(q0)
+    _, _, z, w = _quat_multiply(np.array([-x0, -y0, -z0, w0]), np.asarray(q, dtype=float) / np.linalg.norm(q))
+    angle = 2 * math.atan2(-z, w)  # twist about the controller's own -z
+    return (angle + math.pi) % (2 * math.pi) - math.pi
+
+
+def _radial(position: np.ndarray, pan_axis: np.ndarray, fallback: np.ndarray) -> np.ndarray:
+    """Horizontal unit vector from the pan axis toward `position`: the direction the arm's plane faces."""
+    radial = np.array([position[0] - pan_axis[0], position[1] - pan_axis[1], 0.0])
+    length = np.linalg.norm(radial)
+    return radial / length if length >= MIN_RADIUS_M else fallback
+
+
+def in_plane_angle(approach: np.ndarray, position: np.ndarray, pan_axis: np.ndarray) -> float:
+    """
+    Angle of the gripper's approach in the arm's vertical plane, in radians: 0 pointing straight out, negative
+    pointing down, beyond +-pi/2 folded back toward the base.
+    """
+    horizontal = np.array([approach[0], approach[1], 0.0])
+    own = (
+        horizontal / np.linalg.norm(horizontal)
+        if np.linalg.norm(horizontal) > 1e-9
+        else np.array([1.0, 0, 0])
+    )
+    radial = _radial(position, pan_axis, own)
+    return math.atan2(approach[2], float(approach @ radial))
+
+
+def approach_direction(
+    angle: float, position: np.ndarray, pan_axis: np.ndarray, fallback: np.ndarray
+) -> np.ndarray:
+    """
+    The gripper approach at `angle` (see `in_plane_angle`) in the arm's plane through `position`. This is the
+    only kind of approach the SO-101 can reach there, and it varies smoothly, also through straight down.
+    `fallback` is the plane's direction to use when `position` is above the pan axis.
+    """
+    return math.cos(angle) * _radial(position, pan_axis, fallback) + math.sin(angle) * np.array(
+        [0.0, 0.0, 1.0]
+    )
+
+
+def limit_motion(
+    previous: dict[str, float], goal: dict[str, float], max_joint_step: float, max_tip_step: float, tip_of
+) -> tuple[dict[str, float], bool]:
+    """
+    Moves from `previous` toward `goal` (joint angles, degrees) by at most `max_joint_step` per joint and
+    `max_tip_step` metres at the tip (`tip_of(angles)` gives its position). Returns the angles and whether
+    the move was shortened.
+    """
+    step = {joint: goal[joint] - previous[joint] for joint in goal}
+    largest = max((abs(delta) for delta in step.values()), default=0.0)
+    fraction = min(1.0, max_joint_step / largest) if largest > 0 else 1.0
+    start = tip_of(previous)
+    for _ in range(4):  # the tip isn't linear in the joints: re-check after shrinking
+        moved = {joint: previous[joint] + fraction * delta for joint, delta in step.items()}
+        tip_step = float(np.linalg.norm(tip_of(moved) - start))
+        if tip_step <= max_tip_step + 1e-9:
+            return (goal, False) if fraction == 1.0 else (moved, True)
+        fraction *= max_tip_step / tip_step
+    return {joint: previous[joint] + fraction * delta for joint, delta in step.items()}, True

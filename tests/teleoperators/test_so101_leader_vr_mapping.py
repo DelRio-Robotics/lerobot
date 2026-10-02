@@ -6,11 +6,15 @@ import numpy as np
 import pytest
 
 from lerobot.teleoperators.so101_leader_vr.mapping import (
-    align_yaw_with_position,
+    approach_direction,
     clip_to_box,
     clutch_target,
+    hand_twist,
     head_yaw,
+    in_plane_angle,
+    limit_motion,
     limit_step,
+    pointing_elevation,
     quat_to_matrix,
     xr_to_robot_rotation,
 )
@@ -137,40 +141,102 @@ def test_limit_step_shortens_big_steps_along_their_direction():
     assert limited
 
 
-def approach_of(rotation):
-    return rotation[:, 2]  # the tip's z axis points out of the gripper
+def test_pointing_elevation_is_how_far_the_controller_points_up():
+    assert pointing_elevation(quat_about([0, 1, 0], 0)) == pytest.approx(0.0)
+    assert pointing_elevation(quat_about([1, 0, 0], 30)) == pytest.approx(math.radians(30))
+    assert pointing_elevation(quat_about([1, 0, 0], -90)) == pytest.approx(math.radians(-90))
 
 
-def test_align_yaw_points_the_approach_at_the_target_position():
-    pointing_forward = np.array([[0, 0, 1.0], [0, 1.0, 0], [-1.0, 0, 0]])  # approach along +x
+def test_pointing_elevation_ignores_turning_and_twisting():
+    turned_and_twisted = quat_multiply(quat_about([0, 1, 0], 70), quat_about([0, 0, 1], 50))
 
-    aligned = align_yaw_with_position(
-        pointing_forward, np.array([0.04, 0.25, 0.1]), pan_axis=np.array([0.04, 0])
+    assert pointing_elevation(turned_and_twisted) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_hand_twist_is_the_rotation_about_where_the_controller_points():
+    start = quat_about([0, 1, 0], 0)
+
+    # Turning about XR z turns the controller about its pointing axis (-z) the other way.
+    assert hand_twist(start, quat_about([0, 0, 1], -40)) == pytest.approx(math.radians(40))
+
+
+def test_hand_twist_ignores_turning_and_pitching():
+    start = quat_about([0, 1, 0], 0)
+
+    assert hand_twist(start, quat_about([0, 1, 0], 70)) == pytest.approx(0.0, abs=1e-9)
+    assert hand_twist(start, quat_about([1, 0, 0], -50)) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_hand_twist_is_measured_in_the_controllers_own_frame():
+    pointing_down = quat_about([1, 0, 0], -90)
+    twisted = quat_multiply(pointing_down, quat_about([0, 0, 1], -25))
+
+    assert hand_twist(pointing_down, twisted) == pytest.approx(math.radians(25))
+
+
+def test_in_plane_angle_is_the_approach_elevation_in_the_arm_plane():
+    radial = np.array([0.2, 0.2, 0.1])  # tip off to the left at 45 degrees
+    outward_down = np.array([0.5, 0.5, -1 / math.sqrt(2)])
+
+    assert in_plane_angle(outward_down, radial, pan_axis=np.zeros(2)) == pytest.approx(math.radians(-45))
+
+
+def test_in_plane_angle_beyond_vertical_points_back_toward_the_base():
+    backward_down = np.array([-0.5, 0.0, -0.866])
+
+    angle = in_plane_angle(backward_down, np.array([0.2, 0.0, 0.1]), pan_axis=np.zeros(2))
+
+    assert angle == pytest.approx(math.radians(-120), abs=1e-3)
+
+
+def test_approach_direction_points_outward_at_the_given_elevation():
+    direction = approach_direction(
+        math.radians(-30), np.array([0.0, 0.3, 0.1]), np.zeros(2), np.array([1.0, 0, 0])
     )
 
-    assert approach_of(aligned) == pytest.approx([0, 1, 0], abs=1e-9)
+    assert direction == pytest.approx([0, math.cos(math.radians(30)), -0.5])
 
 
-def test_align_yaw_keeps_pitch():
-    pitched = np.array([[0.5, 0, 0.866], [0, 1.0, 0], [-0.866, 0, 0.5]])  # approach 30 deg above forward
+def test_approach_direction_is_continuous_through_vertical():
+    position, axis, fallback = np.array([0.25, 0.1, 0.1]), np.zeros(2), np.array([1.0, 0, 0])
 
-    aligned = align_yaw_with_position(pitched, np.array([0.2, 0.2, 0.1]), pan_axis=np.zeros(2))
+    below = approach_direction(math.radians(-89.9), position, axis, fallback)
+    beyond = approach_direction(math.radians(-90.1), position, axis, fallback)
 
-    assert approach_of(aligned)[2] == pytest.approx(approach_of(pitched)[2])
-    assert math.atan2(approach_of(aligned)[1], approach_of(aligned)[0]) == pytest.approx(math.radians(45))
-
-
-def test_align_yaw_keeps_an_approach_pointing_back_toward_the_base():
-    pointing_back = rot_z(180) @ np.array([[0, 0, 1.0], [0, 1.0, 0], [-1.0, 0, 0]])  # approach along -x
-
-    aligned = align_yaw_with_position(pointing_back, np.array([0.2, 0.01, 0.1]), pan_axis=np.zeros(2))
-
-    assert approach_of(aligned)[0] < -0.99
+    assert np.linalg.norm(below - beyond) < math.radians(0.3)
 
 
-def test_align_yaw_leaves_a_vertical_approach_alone():
-    pointing_down = np.array([[1.0, 0, 0], [0, -1.0, 0], [0, 0, -1.0]])
+def test_approach_direction_uses_the_fallback_above_the_pan_axis():
+    direction = approach_direction(0.0, np.array([0.001, 0.0, 0.3]), np.zeros(2), np.array([0.0, 1.0, 0]))
 
-    assert align_yaw_with_position(pointing_down, np.array([0.1, 0.2, 0.1]), np.zeros(2)) == pytest.approx(
-        pointing_down
-    )
+    assert direction == pytest.approx([0, 1, 0])
+
+
+def linear_tip(angles):
+    """A stand-in arm whose tip moves 1 cm per degree of shoulder_lift."""
+    return np.array([0.01 * angles["shoulder_lift"], 0.0, 0.0])
+
+
+def test_limit_motion_passes_small_moves():
+    previous = {"shoulder_lift": 0.0, "elbow_flex": 0.0}
+    goal = {"shoulder_lift": 1.0, "elbow_flex": -2.0}
+
+    assert limit_motion(previous, goal, 4.0, 0.02, linear_tip) == (goal, False)
+
+
+def test_limit_motion_caps_the_fastest_joint_and_scales_the_others():
+    previous = {"shoulder_lift": 0.0, "elbow_flex": 0.0}
+
+    moved, limited = limit_motion(previous, {"shoulder_lift": 1.0, "elbow_flex": 40.0}, 4.0, 1.0, linear_tip)
+
+    assert moved == pytest.approx({"shoulder_lift": 0.1, "elbow_flex": 4.0})
+    assert limited
+
+
+def test_limit_motion_caps_the_tip_step():
+    previous = {"shoulder_lift": 0.0, "elbow_flex": 0.0}
+
+    moved, limited = limit_motion(previous, {"shoulder_lift": 3.0, "elbow_flex": 0.0}, 4.0, 0.02, linear_tip)
+
+    assert np.linalg.norm(linear_tip(moved) - linear_tip(previous)) == pytest.approx(0.02)
+    assert limited

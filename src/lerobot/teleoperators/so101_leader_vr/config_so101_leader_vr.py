@@ -50,9 +50,11 @@ class SO101LeaderVRConfig(TeleoperatorConfig):
     # the base). The lower z is the floor.
     ee_bounds_min: list[float] = field(default_factory=lambda: [-0.45, -0.45, 0.0])
     ee_bounds_max: list[float] = field(default_factory=lambda: [0.45, 0.45, 0.45])
-    # Largest move of the target per action, so a tracking glitch can't fling the arm.
+    # Largest move per action, of the target and of what is sent: the tip moves at most this far and no joint
+    # turns more than `max_joint_step_deg`, so neither a tracking glitch nor an awkward wrist pose can fling the arm.
     max_ee_step_m: float = 0.02
-    # The arm has 5 joints, so the tip's orientation is a soft goal next to its position (weight 1).
+    max_joint_step_deg: float = 4.0
+    # How strongly the gripper's pitch follows the hand, next to the tip's position (weight 1).
     orientation_weight: float = 0.1
     ik_iterations: int = 10
     # Keep body joints this many normalized units (of -100..100) inside their calibrated range.

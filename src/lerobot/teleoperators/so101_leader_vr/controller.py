@@ -16,6 +16,7 @@
 
 """Turns the operator's headset input and the follower's joint readings into follower actions. No I/O."""
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -25,16 +26,24 @@ from lerobot.motors import MotorCalibration
 from .config_so101_leader_vr import SO101LeaderVRConfig
 from .kinematics import ArmKinematics
 from .mapping import (
-    align_yaw_with_position,
+    approach_direction,
     clip_to_box,
-    clutch_target,
+    hand_twist,
     head_yaw,
+    in_plane_angle,
+    limit_motion,
     limit_step,
+    pointing_elevation,
     xr_to_robot_rotation,
 )
-from .units import MOTORS, from_follower_units, to_follower_units
+from .units import ARM_JOINTS, MOTORS, from_follower_units, normalized_to_degrees, to_follower_units
 
 _FLOOR_TOLERANCE_M = 0.002
+# How far the gripper's pitch target may run ahead of the pitch the arm reached: beyond what the arm can do,
+# tilting the hand further does nothing (instead of dragging the tip away), and tilting back responds at once.
+_MAX_PITCH_LEAD = math.radians(10)
+# A solution whose tip misses the target by more than this is being pulled off by the pitch goal.
+_POSITION_TOLERANCE_M = 0.002
 
 
 @dataclass
@@ -51,10 +60,23 @@ class XRInput:
     received_at: float  # time.monotonic() when it arrived
 
 
+@dataclass
+class _Anchor:
+    """Where the hand and the target were when following (re)started."""
+
+    hand_position: np.ndarray
+    position: np.ndarray
+
+
 class VRArmController:
     """
-    A virtual leader arm. Holding grip engages it: the gripper tip then moves and turns from where it was by
-    as much as the hand does. Releasing grip, or losing the headset's data, holds the arm where it is.
+    A virtual leader arm. Holding grip engages it, and from then on, relative to where grip was pressed:
+    - the gripper tip moves as much as the hand does (`motion_scale`),
+    - the gripper pitches as much as the hand pitches (world frame: tilting the hand down tilts the gripper down),
+    - the gripper turns about its own axis as much as the hand twists about where it points.
+    Turning the hand about the vertical does nothing: the arm's direction comes from where the tip is.
+    Releasing grip, or losing the headset's data, holds the arm where it is. Every action moves the tip at most
+    `max_ee_step_m` and each joint at most `max_joint_step_deg`.
     """
 
     def __init__(
@@ -68,6 +90,16 @@ class VRArmController:
         self.kinematics = kinematics
         self._forward = kinematics.forward_axis()
         self._pan_axis = kinematics.pan_axis()
+        self._roll_sign = kinematics.roll_sign()
+        # The IK keeps every joint inside its calibrated range (minus the margin) as well as the model's limits.
+        limit = 100 - config.joint_margin
+        kinematics.limit_joints(
+            {
+                joint: tuple(sorted(normalized_to_degrees(v, calibration[joint]) for v in (-limit, limit)))
+                for joint in ARM_JOINTS
+            }
+        )
+        self._roll_range = kinematics.joint_limits("wrist_roll")
         self._xr_to_robot = xr_to_robot_rotation(self._forward, 0.0, config.yaw_offset_deg)
         self._low = np.array(config.ee_bounds_min, dtype=float)
         self._high = np.array(config.ee_bounds_max, dtype=float)
@@ -82,8 +114,13 @@ class VRArmController:
         self._was_gripping = False
         self._was_precise = False
         self._was_recentering = False
-        self._anchor: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
-        self._target = np.eye(4)
+        self._anchor: _Anchor | None = None
+        self._last_hand_orientation = np.array([0.0, 0.0, 0.0, 1.0])
+        self._last_hand_elevation = 0.0
+        # The latest target: tip position, approach angle in the arm's plane (radians), wrist roll (degrees).
+        self._target_position = np.zeros(3)
+        self._target_angle = 0.0
+        self._target_roll = 0.0
         self.status = {"engaged": False, "stale": True, "limited": False}
 
     def observe(self, observation: dict) -> None:
@@ -118,7 +155,10 @@ class VRArmController:
             self._engaged = False
         elif not self._was_gripping:
             self._engaged = self._gripper_active = True
-            self._target = self.kinematics.fk(self._angles)
+            pose = self.kinematics.fk(self._angles)
+            self._target_position = pose[:3, 3]
+            self._target_angle = in_plane_angle(pose[:3, 2], self._target_position, self._pan_axis)
+            self._target_roll = float(np.clip(self._angles["wrist_roll"], *self._roll_range))
             self._anchor_at(xr)
         self._was_gripping = xr.grip
 
@@ -130,41 +170,85 @@ class VRArmController:
 
         if self._gripper_active:
             trigger = min(max(xr.trigger, 0.0), 1.0)
-            self._gripper = (
-                self.config.gripper_open + (self.config.gripper_closed - self.config.gripper_open) * trigger
-            )
+            span = self.config.gripper_closed - self.config.gripper_open
+            self._gripper = self.config.gripper_open + span * trigger
             self._hold = {**self._hold, "gripper.pos": min(max(self._gripper, 0.0), 100.0)}
 
         self.status["engaged"] = self._engaged
         return dict(self._hold)
 
     def _anchor_at(self, xr: XRInput) -> None:
-        self._anchor = (xr.position.copy(), xr.orientation.copy(), self._target.copy())
+        """Following continues from the current target, so re-anchoring never jumps."""
+        self._anchor = _Anchor(hand_position=xr.position.copy(), position=self._target_position.copy())
+        self._last_hand_orientation = xr.orientation.copy()
+        self._last_hand_elevation = pointing_elevation(xr.orientation)
 
     def _follow(self, xr: XRInput) -> None:
-        c0_pos, c0_quat, t0 = self._anchor
+        anchor = self._anchor
         scale = self.config.motion_scale * (0.5 if xr.precision else 1.0)
-        target = clutch_target(t0, c0_pos, c0_quat, xr.position, xr.orientation, self._xr_to_robot, scale)
-
+        position = anchor.position + scale * self._xr_to_robot @ (xr.position - anchor.hand_position)
         # A tip already below the floor (e.g. resting on the table) may stay there or rise, but not sink.
         low = self._low.copy()
-        low[2] = min(low[2], self._target[2, 3])
-        position, clipped = clip_to_box(target[:3, 3], low, self._high)
-        position, stepped = limit_step(self._target[:3, 3], position, self.config.max_ee_step_m)
-        target[:3, 3] = position
-        target[:3, :3] = align_yaw_with_position(target[:3, :3], position, self._pan_axis)
-        self._target = target
+        low[2] = min(low[2], self._target_position[2])
+        position, clipped = clip_to_box(position, low, self._high)
+        position, stepped = limit_step(self._target_position, position, self.config.max_ee_step_m)
+        self._target_position = position
+        elevation = pointing_elevation(xr.orientation)
+        self._target_angle += elevation - self._last_hand_elevation
+        self._last_hand_elevation = elevation
+        # The twist is added up tick by tick, so it never wraps at half a turn, and it slides along the wrist's
+        # limits: twisting further does nothing, twisting back responds at once.
+        twist = hand_twist(self._last_hand_orientation, xr.orientation)
+        self._last_hand_orientation = xr.orientation.copy()
+        self._target_roll = float(
+            np.clip(self._target_roll + self._roll_sign * math.degrees(twist), *self._roll_range)
+        )
 
-        angles = self.kinematics.ik(
-            self._angles, target, self.config.orientation_weight, self.config.ik_iterations
+        goal = self._solve(position, self._target_angle)
+        overreached = bool(np.linalg.norm(self.kinematics.fk(goal)[:3, 3] - position) > _POSITION_TOLERANCE_M)
+        if overreached:
+            # The pitch asked for is out of reach here (e.g. the wrist is at its limit) and the solver is trading
+            # the tip's position for it. Position comes first: keep the pitch the arm has and place the tip.
+            current = self.kinematics.fk(self._angles)
+            self._target_angle = in_plane_angle(current[:3, 2], current[:3, 3], self._pan_axis)
+            goal = self._solve(position, self._target_angle)
+        # Keep inside the calibrated range, then bound what is actually sent.
+        goal, _ = from_follower_units(
+            to_follower_units(goal, 0.0, self.calibration, self.config.joint_margin, self.config.use_degrees),
+            self.calibration,
+            self.config.use_degrees,
         )
-        tip_z = self.kinematics.fk(angles)[2, 3]
-        # The target is already clipped to the floor; this catches IK solutions that dip well below it.
-        sinks = tip_z < self._low[2] - _FLOOR_TOLERANCE_M and tip_z < self.kinematics.fk(self._angles)[2, 3]
-        self.status["limited"] = bool(clipped or stepped or sinks)
-        if sinks:
-            return
-        self._hold = to_follower_units(
-            angles, self._gripper, self.calibration, self.config.joint_margin, self.config.use_degrees
+        moved, shortened = limit_motion(
+            self._angles,
+            goal,
+            self.config.max_joint_step_deg,
+            self.config.max_ee_step_m,
+            lambda angles: self.kinematics.fk(angles)[:3, 3],
         )
-        self._angles, _ = from_follower_units(self._hold, self.calibration, self.config.use_degrees)
+        # The target is already clipped to the floor; this catches moves that dip well below it.
+        tip_z = self.kinematics.fk(moved)[2, 3]
+        sinks = bool(
+            tip_z < self._low[2] - _FLOOR_TOLERANCE_M and tip_z < self.kinematics.fk(self._angles)[2, 3]
+        )
+        if not sinks:
+            self._hold = to_follower_units(
+                moved, self._gripper, self.calibration, self.config.joint_margin, self.config.use_degrees
+            )
+            self._angles, _ = from_follower_units(self._hold, self.calibration, self.config.use_degrees)
+
+        reached = self.kinematics.fk(self._angles)
+        reached_angle = in_plane_angle(reached[:3, 2], reached[:3, 3], self._pan_axis)
+        lead = (self._target_angle - reached_angle + math.pi) % (2 * math.pi) - math.pi
+        self._target_angle = reached_angle + float(np.clip(lead, -_MAX_PITCH_LEAD, _MAX_PITCH_LEAD))
+        overreached = overreached or abs(lead) > _MAX_PITCH_LEAD
+        self.status["limited"] = bool(clipped or stepped or shortened or sinks or overreached)
+
+    def _solve(self, position: np.ndarray, angle: float) -> dict[str, float]:
+        approach = approach_direction(angle, position, self._pan_axis, self._forward)
+        return self.kinematics.ik(
+            {**self._angles, "wrist_roll": self._target_roll},
+            position,
+            approach,
+            self.config.orientation_weight,
+            self.config.ik_iterations,
+        )
