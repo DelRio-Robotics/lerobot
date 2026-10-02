@@ -33,6 +33,7 @@ python -m lerobot.robots.so101_follower.so101_follower_host \
 import base64
 import json
 import logging
+import math
 import threading
 import time
 from dataclasses import asdict
@@ -84,50 +85,82 @@ class SO101FollowerHost:
 def _control_loop(
     robot: Robot, host: SO101FollowerHost, joints: dict, lock: threading.Lock, stop: threading.Event
 ):
-    """Applies each command as soon as it arrives and keeps `joints` up to date. The only thread using the bus."""
+    """
+    Moves the arm toward the latest commanded position at a steady `control_freq_hz`, easing in over
+    `smoothing_ms`, so commands that arrive late or bunched up (network jitter) don't make the arm jerk.
+    Also keeps `joints` up to date. The only thread using the bus.
+    """
     cfg = host.config
+    period = 1 / cfg.control_freq_hz
+    alpha = 1 - math.exp(-period / (cfg.smoothing_ms / 1000)) if cfg.smoothing_ms > 0 else 1.0
+
+    def read_joints() -> dict:
+        present = robot.bus.sync_read("Present_Position")
+        state = {f"{motor}.pos": val for motor, val in present.items()}
+        with lock:
+            joints.update(state)
+        return state
+
+    # Start easing from where the arm is, so the first command doesn't snap it to the leader's pose.
+    goal = read_joints()
+    target: dict = {}
     last_cmd_time = None
     watchdog_active = False
-    last_read = 0.0
-    n_cmds, last_stats = 0, time.perf_counter()
+    last_read = time.perf_counter()
+    n_cmds, max_gap, last_stats = 0, 0.0, time.perf_counter()
+    next_tick = time.perf_counter()
 
     while not stop.is_set():
-        if host.zmq_cmd_socket.poll(5, zmq.POLLIN):
+        if host.zmq_cmd_socket.poll(max(next_tick - time.perf_counter(), 0) * 1000, zmq.POLLIN):
             try:
-                robot.send_action(json.loads(host.zmq_cmd_socket.recv_string(zmq.NOBLOCK)))
-                n_cmds += 1
+                target.update(json.loads(host.zmq_cmd_socket.recv_string(zmq.NOBLOCK)))
+                now = time.perf_counter()
                 if last_cmd_time is None or watchdog_active:
                     logging.info("Receiving commands")
-                last_cmd_time = time.perf_counter()
+                else:
+                    max_gap = max(max_gap, now - last_cmd_time)
+                last_cmd_time = now
                 watchdog_active = False
+                n_cmds += 1
             except zmq.Again:
                 pass
             except Exception as e:
-                logging.error("Failed to apply command: %s", e)
+                logging.error("Bad command: %s", e)
 
         now = time.perf_counter()
+        if now < next_tick:
+            continue
+        next_tick = next_tick + period if now - next_tick < period else now + period
+
+        if target and any(abs(target[k] - goal.get(k, target[k])) > 0.01 for k in target):
+            goal = {k: goal.get(k, v) + alpha * (v - goal.get(k, v)) for k, v in target.items()}
+            try:
+                robot.send_action(goal)
+            except Exception as e:
+                logging.error("Failed to apply command: %s", e)
+
         if (
             last_cmd_time is not None
             and not watchdog_active
             and now - last_cmd_time > cfg.watchdog_timeout_ms / 1000
         ):
-            # The servos keep their last goal position, so the arm just holds still.
+            # The arm finishes easing to the last command and holds there.
             logging.warning(f"No command for {cfg.watchdog_timeout_ms} ms. Holding position.")
             watchdog_active = True
 
         if now - last_read >= 1 / 60:
             try:
-                present = robot.bus.sync_read("Present_Position")
-                with lock:
-                    joints.update({f"{motor}.pos": val for motor, val in present.items()})
+                read_joints()
                 last_read = now
             except Exception as e:
                 logging.error("Failed to read joints: %s", e)
 
         if now - last_stats >= 10:
             if n_cmds:
-                logging.info(f"Applying {n_cmds / (now - last_stats):.0f} commands/s")
-            n_cmds, last_stats = 0, now
+                logging.info(
+                    f"Receiving {n_cmds / (now - last_stats):.0f} commands/s, longest gap {max_gap * 1e3:.0f} ms"
+                )
+            n_cmds, max_gap, last_stats = 0, 0.0, now
 
 
 def run_host(robot: Robot, host: SO101FollowerHost) -> None:

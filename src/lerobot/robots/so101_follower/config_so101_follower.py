@@ -55,6 +55,12 @@ class SO101FollowerHostConfig:
     # Log a warning when no command arrives for this long. The arm holds its last goal position.
     watchdog_timeout_ms: int = 500
 
+    # The arm is moved toward the latest command this many times a second, easing in over `smoothing_ms`.
+    # Smoothing hides network jitter (late or bunched-up commands) at the cost of about that much extra lag.
+    # 0 applies each command as-is.
+    control_freq_hz: int = 100
+    smoothing_ms: int = 40
+
     # Max rate of observations (joints + camera frames) sent back. Commands are applied as they arrive regardless.
     max_loop_freq_hz: int = 30
 
