@@ -57,13 +57,19 @@ def lan_ip() -> str:
             return "127.0.0.1"
 
 
+# 64 bits: far too many to guess, even by trying thousands of tokens a second for years.
+TOKEN_BYTES = 8
+
+
 def load_or_create_token(directory: Path) -> str:
     """The secret the page must present (`?k=`), kept across runs so a bookmarked URL keeps working."""
     path = Path(directory) / "token.txt"
     if path.is_file():
-        return path.read_text().strip()
+        token = path.read_text().strip()
+        if len(token) >= 2 * TOKEN_BYTES:
+            return token
     path.parent.mkdir(parents=True, exist_ok=True)
-    token = secrets.token_hex(3)
+    token = secrets.token_hex(TOKEN_BYTES)
     path.write_text(token)
     return token
 

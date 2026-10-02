@@ -309,3 +309,18 @@ def test_stop_frees_the_port_while_a_client_is_stuck(client_dir):
     again = VRServer(client_dir, port=port, https=False, token=TOKEN, hand="right", stream_fps=20)
     again.start()
     again.stop()
+
+
+def test_new_tokens_are_too_long_to_guess(tmp_path):
+    token = load_or_create_token(tmp_path)
+
+    assert len(token) >= 16  # 64 bits in hex
+
+
+def test_a_short_token_from_an_older_version_is_replaced(tmp_path):
+    (tmp_path / "token.txt").write_text("abc123")
+
+    token = load_or_create_token(tmp_path)
+
+    assert len(token) >= 16
+    assert (tmp_path / "token.txt").read_text().strip() == token
