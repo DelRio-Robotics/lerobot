@@ -59,7 +59,7 @@ class SO101FollowerHostConfig:
     # Smoothing hides network jitter (late or bunched-up commands) at the cost of about that much extra lag.
     # 0 applies each command as-is.
     control_freq_hz: int = 100
-    smoothing_ms: int = 40
+    smoothing_ms: int = 25
 
     # Max rate of observations (joints + camera frames) sent back. Commands are applied as they arrive regardless.
     max_loop_freq_hz: int = 30
